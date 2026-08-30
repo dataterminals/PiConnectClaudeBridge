@@ -1,0 +1,7 @@
+# Nothing here should ever hold a capture from a real session: transcripts carry hostnames,
+# paths, and whatever happened to be on screen. Keep them out of a public repo.
+captures/
+*.capture.txt
+
+node_modules/
+.claude/settings.local.json

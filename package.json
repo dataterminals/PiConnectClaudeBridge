@@ -1,0 +1,10 @@
+{
+  "name": "pi-connect-claude-bridge",
+  "version": "0.1.0",
+  "description": "Turns the Raspberry Pi Connect browser shell into a callable API.",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test": "node tests/protocol.test.js"
+  }
+}
