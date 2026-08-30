@@ -136,3 +136,58 @@ marker test ok<<
 ```
 
 Correct exit code, both markers found, echo excluded, ANSI stripped.
+
+---
+
+# The sidecar link, and the browser permission that gates it
+
+The optional MCP sidecar runs on the machine, and the userscript connects **out** to it on
+`ws://127.0.0.1:8732/pix`. Two browser mechanisms stand between an HTTPS page and a loopback
+socket, and only one of them is fixable in code.
+
+## 1. Private Network Access — fixable, and the failure is silent
+
+A `ws://` URL pointing at loopback is **not** blocked as mixed content: loopback counts as a
+potentially trustworthy origin. Private Network Access is the separate mechanism that bites. A
+public HTTPS origin reaching a private address must first pass a CORS preflight that the target
+answers with `Access-Control-Allow-Private-Network: true`.
+
+`ws`'s built-in server answers `426 Upgrade Required` to anything that is not an upgrade, which
+fails that preflight — and it fails *invisibly*. Observed 2026-08-30 with a bare
+`new WebSocketServer({ port })`:
+
+* the page's `WebSocket` fired **no** `open`, **no** `error` and **no** `close`; it sat `pending`
+  indefinitely,
+* the console logged nothing at all,
+* but `netstat` showed `msedge` **ESTABLISHED** against the node process,
+* while the server had logged no connection.
+
+So the hub runs a real `http.Server`, answers `OPTIONS` with the PNA headers, and attaches the
+WebSocket server to it. `sidecar/test/hub.test.js` pins those headers.
+
+## 2. Local Network Access permission — not fixable in code
+
+Chromium 152 (Edge 152) ships a **Local Network Access permission**. Querying it from the page:
+
+```js
+await navigator.permissions.query({ name: 'local-network-access' })   // → { state: 'prompt' }
+```
+
+While that permission is in `prompt`, the first loopback request from the origin raises a
+permission prompt, and **the request hangs until the prompt is answered**. Both `fetch` and
+`WebSocket` hang identically — again with no error and no console output, which is
+indistinguishable from the PNA failure above.
+
+The trap: **a background tab cannot show that prompt.** During testing the Pi Connect tab reported
+`document.hidden === true`, so nothing was ever displayed and every request hung forever. Fixing
+the PNA headers changed nothing until the tab was brought to the foreground.
+
+If the sidecar never connects, check in this order:
+
+1. `GET http://127.0.0.1:8732/health` from a terminal — proves the sidecar is up.
+2. `navigator.permissions.query({ name: 'local-network-access' })` on the Pi Connect page. If it
+   says `prompt`, **foreground the tab** and answer the permission prompt. If it says `denied`,
+   clear it in the site settings for `connect.raspberrypi.com`.
+3. Only then suspect the hub.
+
+A hanging request with no error is almost never a bug in the hub. It is one of these two.

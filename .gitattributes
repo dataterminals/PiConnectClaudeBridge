@@ -4,3 +4,6 @@
 *.js   text eol=lf
 *.md   text eol=lf
 *.json text eol=lf
+
+# Batch files must keep CRLF or cmd.exe can mis-parse them.
+*.cmd  text eol=crlf

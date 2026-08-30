@@ -1,0 +1,16 @@
+{
+  "name": "pi-connect-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP stdio server that relays commands to the Pi Connect bridge userscript over a loopback WebSocket.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/hub.test.js && node test/mcp.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "ws": "^8.21.3"
+  }
+}

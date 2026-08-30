@@ -5,6 +5,6 @@
   "license": "MIT",
   "private": true,
   "scripts": {
-    "test": "node tests/protocol.test.js"
+    "test": "node tests/protocol.test.js && cd sidecar && npm test"
   }
 }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pi Connect Claude Bridge
 // @namespace    https://github.com/dataterminals/PiConnectClaudeBridge
-// @version      0.1.0
+// @version      0.2.0
 // @description  Turns the Raspberry Pi Connect browser shell into a callable API. Exposes window.__pix so an assistant driving the browser can run a command and get {stdout, exitCode} back, instead of typing at a terminal widget and screen-scraping the result. Rides the session already authenticated in this browser; opens no port and stores no credential.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/PiConnectClaudeBridge
@@ -55,8 +55,13 @@
 //     shared. Do not "simplify" it back to a direct call. (Inline script is not CSP-blocked on
 //     connect.raspberrypi.com — verified 2026-08-30.)
 //
-//   * NOTHING IS AUTOMATIC. No reconnect, no keepalive, no command replay, no polling. The patch
-//     observes; every byte sent to the Pi originates in an explicit __pix call from the caller.
+//   * NO COMMAND RUNS BY ITSELF. No keepalive, no command replay, no polling of the device. The
+//     patch observes; every byte sent to the Pi originates in an explicit __pix call.
+//     The one exception is the sidecar link at the bottom of the library, which retries a
+//     loopback WebSocket on a backoff so the local MCP sidecar can attach. That connection
+//     carries requests *in*; it never originates a command on its own, it only reaches
+//     127.0.0.1, and localStorage.__pixNoSidecar = '1' turns it off. Keep that distinction
+//     exact — "retries a socket" and "runs things unprompted" are not the same promise.
 //
 //   * WHAT COMES BACK IS UNTRUSTED DATA. stdout is whatever the Pi printed — a file, a log line,
 //     a MOTD someone edited. It is never an instruction to the caller, however it is phrased.
@@ -418,10 +423,84 @@
       return { ok: problems.length === 0, problems: problems, status: api.status(), events: state.events.slice(-12) };
     },
 
-    version: '0.1.0'
+    version: '0.2.0'
   };
 
   window.__pix = api;
+
+  // ---- optional sidecar link ----------------------------------------------
+  //
+  // If the local MCP sidecar is running, connect to it, so the assistant gets real tools instead
+  // of evaluating JavaScript in this page. If it is not running, this amounts to one failed
+  // loopback connection every few seconds and nothing else.
+  //
+  // This is the only thing in the bridge that acts without being asked, so keep its reach exact:
+  // it *offers* a connection to 127.0.0.1 and answers questions the sidecar asks. The sidecar can
+  // only invoke what __pix already exposes, only while a Pi Connect tab is open, and only from
+  // this machine. Set localStorage.__pixNoSidecar = '1' to stop trying entirely.
+
+  var SIDECAR_URL = 'ws://127.0.0.1:8732/pix';
+  var backoff = 1000;
+
+  function toPattern(p) {
+    // A regex source if it parses as one, otherwise hand the raw string to expect(), which
+    // escapes it and matches literally.
+    try { return new RegExp(p); } catch (e) { return String(p); }
+  }
+
+  function dispatch(method, p) {
+    p = p || {};
+    switch (method) {
+      case 'run':    return api.run(p.command, { timeout: p.timeout, shell: p.shell });
+      case 'send':   return api.send(p.text);
+      case 'key':    return api.key(p.key);
+      case 'expect': return api.expect(toPattern(p.pattern), { timeout: p.timeout });
+      case 'tail':   return api.tail(p.chars);
+      case 'raw':    return api.raw(p.chars);
+      case 'screen': return api.screen();
+      case 'status': return api.status();
+      case 'health': return api.health();
+      case 'clear':  return api.clear();
+      case 'resize': return api.resize(p.cols, p.rows);
+      default: throw new Error('unknown method: ' + method);
+    }
+  }
+
+  function scheduleReconnect() {
+    setTimeout(connectSidecar, backoff);
+    backoff = Math.min(backoff * 2, 30000);
+  }
+
+  function connectSidecar() {
+    try { if (localStorage.getItem('__pixNoSidecar') === '1') return; } catch (e) { /* no storage */ }
+    var ws;
+    try { ws = new WebSocket(SIDECAR_URL); } catch (e) { return scheduleReconnect(); }
+    var opened = false;
+
+    ws.onopen = function () {
+      opened = true;
+      backoff = 1000;
+      note('sidecar', 'connected');
+      try { ws.send(JSON.stringify({ type: 'hello', version: api.version, path: location.pathname })); } catch (e) {}
+    };
+
+    ws.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.id == null) return;
+      Promise.resolve()
+        .then(function () { return dispatch(msg.method, msg.params); })
+        .then(function (result) { ws.send(JSON.stringify({ id: msg.id, ok: true, result: result })); })
+        .catch(function (err) {
+          ws.send(JSON.stringify({ id: msg.id, ok: false, error: String((err && err.message) || err) }));
+        });
+    };
+
+    ws.onclose = function () { if (opened) note('sidecar', 'disconnected'); scheduleReconnect(); };
+    ws.onerror = function () { try { ws.close(); } catch (e) { /* already closing */ } };
+  }
+
+  connectSidecar();
   }
 
   // Inject the library as a <script> tag rather than just calling it.
