@@ -195,6 +195,14 @@ The userscript suite runs the real script against a fake PTY that is unhelpful i
 real one is — it echoes the command line back before any output, splits frames mid-UTF-8-character,
 and wraps everything in CRLF and colour escapes. No Pi required for any of it.
 
+There is also a live check that needs the real thing — a browser with the bridge installed, a
+remote-shell tab open, and a Pi answering — which drives the whole chain through the MCP
+interface rather than around it:
+
+```bash
+cd sidecar && node test/live-e2e.js
+```
+
 ## Layout
 
 ```
