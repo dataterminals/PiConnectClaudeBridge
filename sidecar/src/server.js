@@ -11,7 +11,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createHub, DEFAULT_PORT } from './hub.js';
+import { createHub, describeStartupFailure, DEFAULT_PORT } from './hub.js';
 
 const argv = process.argv.slice(2);
 const portArg = argv.indexOf('--port');
@@ -158,8 +158,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'pi_screen':
         return text((await hub.call('screen', {})) || '(no terminal widget on the page)');
       case 'pi_health': {
+        if (startupError) return failure(describeStartupFailure(startupError, port));
         const h = await hub.call('health', {});
-        return text(JSON.stringify(h, null, 2));
+        return text(JSON.stringify({ attachedPage: hub.info(), bridge: h }, null, 2));
       }
       default:
         return failure('unknown tool: ' + name);
@@ -169,10 +170,36 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-await hub.listen();
-await server.connect(new StdioServerTransport());
-process.stderr.write('[pix] MCP server ready\n');
-
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, async () => { await hub.close(); process.exit(0); });
+// Start the MCP transport even if the listener could not bind.
+//
+// The first version awaited hub.listen() first and let a failure take the process down. A busy
+// port therefore produced no MCP server at all, and the client reported only "Connection closed"
+// — no port, no reason, nothing to act on. An unusable tool that can still say why it is unusable
+// beats one that vanishes, so binding failures are carried into every tool result and pi_health.
+let startupError = null;
+try {
+  await hub.listen();
+} catch (e) {
+  startupError = e;
+  process.stderr.write('[pix] ' + describeStartupFailure(e, port) + '\n');
 }
+
+await server.connect(new StdioServerTransport());
+process.stderr.write('[pix] MCP server ready' + (startupError ? ' (degraded: no loopback listener)' : '') + '\n');
+
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try { await hub.close(); } catch { /* going away regardless */ }
+  process.exit(0);
+}
+
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, shutdown);
+
+// Exit when the client goes away. An MCP stdio server whose stdin has closed has no one left to
+// serve, and on Windows a parent exiting does not necessarily signal the child — so without this
+// the process lingers holding the port, and the *next* session cannot bind. That is exactly the
+// orphan that produced a bare "Connection closed" on startup.
+process.stdin.on('close', shutdown);
+process.stdin.on('end', shutdown);

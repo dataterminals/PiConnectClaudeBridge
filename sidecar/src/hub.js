@@ -24,6 +24,24 @@ export const DEFAULT_ORIGIN = 'https://connect.raspberrypi.com';
 export const WS_PATH = '/pix';
 
 /**
+ * Turn a startup failure into something a person can act on.
+ *
+ * A busy port is overwhelmingly the common case, and it has one overwhelmingly common cause: an
+ * earlier sidecar that never exited. Saying "EADDRINUSE" and stopping would leave the reader to
+ * work that out; a tool that cannot run should still explain itself.
+ */
+export function describeStartupFailure(err, port) {
+  if (err && err.code === 'EADDRINUSE') {
+    return 'the sidecar could not claim 127.0.0.1:' + port + ' because something else already ' +
+      'holds it — almost always an earlier sidecar that outlived its session. Stop that process ' +
+      '(on Windows: netstat -ano | findstr :' + port + ', then taskkill /PID <pid> /F) and ' +
+      'restart, or set PIX_PORT to another port. Note the userscript looks for ' + DEFAULT_PORT +
+      ', so a different port needs the script changed to match.';
+  }
+  return 'the sidecar could not start its loopback listener: ' + (err && err.message);
+}
+
+/**
  * @param {object}   [opts]
  * @param {number}   [opts.port]
  * @param {string}   [opts.origin]  the only browser origin allowed to connect
@@ -36,6 +54,7 @@ export function createHub(opts = {}) {
 
   let client = null;          // the one connected page
   let clientInfo = null;      // whatever it told us about itself on connect
+  let lastError = null;       // why the hub is not usable, if it is not
   let nextId = 1;
   const pending = new Map();  // id -> { resolve, reject, timer }
 
@@ -128,6 +147,9 @@ export function createHub(opts = {}) {
    * transport error. Only a genuinely unreachable page should trip this.
    */
   function call(method, params = {}, timeoutMs = 45000) {
+    if (lastError) {
+      return Promise.reject(new Error(describeStartupFailure(lastError, port)));
+    }
     if (!isConnected()) {
       return Promise.reject(new Error(
         'no Pi Connect page is connected. Open the remote shell for the device in the browser ' +
@@ -150,10 +172,17 @@ export function createHub(opts = {}) {
     });
   }
 
+  // `ws` re-emits the HTTP server's errors on itself, and an 'error' event with no listener is a
+  // throw. Without this, a busy port took down the whole process -- including the MCP server that
+  // had not started yet -- and the caller saw only "Connection closed" with no hint of a port.
+  wss.on('error', (e) => { lastError = e; log('websocket server error: ' + e.message); });
+
   function listen() {
     return new Promise((resolve, reject) => {
-      httpServer.once('error', reject);
+      const onError = (e) => { lastError = e; reject(e); };
+      httpServer.once('error', onError);
       httpServer.listen(port, '127.0.0.1', () => {      // loopback only, never the LAN
+        httpServer.removeListener('error', onError);
         log('listening on 127.0.0.1:' + port);
         resolve();
       });
@@ -168,5 +197,5 @@ export function createHub(opts = {}) {
     return new Promise((resolve) => httpServer.close(resolve));
   }
 
-  return { call, listen, close, isConnected, info: () => clientInfo, port };
+  return { call, listen, close, isConnected, info: () => clientInfo, error: () => lastError, port };
 }

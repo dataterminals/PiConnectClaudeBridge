@@ -72,6 +72,51 @@ test('says so plainly when no page is connected', async () => {
   assert.match(r.result.content[0].text, /no Pi Connect page is connected/);
 });
 
+// A busy port used to kill the process outright, so the MCP client saw only "Connection closed"
+// with no mention of a port. Hit for real: an orphaned sidecar outlived its session and the next
+// one could not start. A tool that cannot work must still be able to say why.
+test('still serves MCP when the port is already taken, and says so', async () => {
+  const squatter = spawn(process.execPath, [SERVER, '--port', String(PORT)], { stdio: 'ignore' });
+  try {
+    await new Promise((r) => setTimeout(r, 1200));      // let the squatter claim the port
+
+    const second = spawn(process.execPath, [SERVER, '--port', String(PORT)], {
+      stdio: ['pipe', 'pipe', 'ignore']
+    });
+    try {
+      let buf2 = '';
+      const reply = (id) => new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('no reply')), 8000);
+        second.stdout.on('data', (c) => {
+          buf2 += c.toString();
+          for (const line of buf2.split('\n')) {
+            if (!line.trim()) continue;
+            let m; try { m = JSON.parse(line); } catch { continue; }
+            if (m.id === id) { clearTimeout(t); resolve(m); }
+          }
+        });
+      });
+      const send = (id, method, params) =>
+        second.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+
+      const initPromise = reply(1);
+      send(1, 'initialize', {
+        protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '0' }
+      });
+      const init = await initPromise;
+      assert.strictEqual(init.result.serverInfo.name, 'pi-connect-bridge',
+        'the server must still come up rather than exiting');
+
+      const healthPromise = reply(2);
+      send(2, 'tools/call', { name: 'pi_health', arguments: {} });
+      const h = await healthPromise;
+      assert.strictEqual(h.result.isError, true);
+      assert.match(h.result.content[0].text, /already holds it/);
+      assert.match(h.result.content[0].text, new RegExp(String(PORT)));
+    } finally { second.kill(); }
+  } finally { squatter.kill(); }
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of tests) {
