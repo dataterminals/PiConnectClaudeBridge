@@ -130,8 +130,11 @@ interrupting is one it started itself. Pass `{ interruptOnTimeout: false }` to l
 
 * **No UI.** It renders nothing, binds no hotkey, and changes nothing you can see. It defines
   `window.__pix` and stops.
-* **Nothing automatic.** No reconnect, no keepalive, no polling, no command replay. Every byte
-  sent to the Pi originates in an explicit `__pix` call.
+* **No command runs by itself.** No keepalive, no polling of the device, no command replay. Every
+  byte sent to the Pi originates in an explicit `__pix` call. The one automatic behaviour anywhere
+  in this repo is the optional sidecar link retrying a loopback socket on a backoff; it carries
+  requests *in*, reaches only `127.0.0.1`, and stops entirely if you set
+  `localStorage.__pixNoSidecar = '1'`.
 * **No credentials, ever.** It reads no cookie, no token, and no password. It attaches to a
   transport the page had already built.
 * **No new exposure.** It opens no port and changes no config on the Pi. Anything you can do
@@ -156,11 +159,15 @@ the sidecar never reaches the Pi itself and does nothing at all unless a Pi Conn
 cd sidecar && npm install
 ```
 
-Then register it with Claude Code:
+Then register it with Claude Code. Use `-s user`, or it is scoped to whichever directory you
+happened to run the command in and silently will not load anywhere else:
 
 ```bash
-claude mcp add pi-connect -- node "D:/Github Repositories/PiConnectClaudeBridge/sidecar/src/server.js"
+claude mcp add -s user pi-connect -- node "/absolute/path/to/PiConnectClaudeBridge/sidecar/src/server.js"
 ```
+
+MCP servers are launched when a session starts, so restart Claude Code before the `pi_*` tools
+appear.
 
 ### The browser will ask permission the first time
 
