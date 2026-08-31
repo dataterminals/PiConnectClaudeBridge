@@ -169,6 +169,22 @@ claude mcp add -s user pi-connect -- node "/absolute/path/to/PiConnectClaudeBrid
 MCP servers are launched when a session starts, so restart Claude Code before the `pi_*` tools
 appear.
 
+### Which window is the transport
+
+Any `connect.raspberrypi.com` page with a live remote shell will do, and **the detached remote
+session window on its own is enough** — the dashboard tab is not part of the path. The shell page
+is where the WebRTC channel and the sidecar link both live, so that one window is the whole
+transport. It can stay minimised or buried behind other windows: output is captured off the wire,
+not off the screen.
+
+With **more than one** shell window open, the first to attach keeps the bridge and the others
+stand by, taking over within ~30s if the holder closes. Whichever window is serving is named in
+`pi_health` — worth a glance if you have shells open to more than one device, because the bridge
+will happily talk to whichever one holds the slot.
+
+(An earlier version preferred the newest window instead, which made two open tabs evict each other
+about once a second, forever. Fixed in 0.2.1; `sidecar/test/hub.test.js` pins the behaviour.)
+
 ### The browser will ask permission the first time
 
 Chromium 152 and later gate loopback access behind a **Local Network Access** permission, and the

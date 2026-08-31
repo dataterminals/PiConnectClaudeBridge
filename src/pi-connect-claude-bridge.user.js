@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pi Connect Claude Bridge
 // @namespace    https://github.com/dataterminals/PiConnectClaudeBridge
-// @version      0.2.0
+// @version      0.2.1
 // @description  Turns the Raspberry Pi Connect browser shell into a callable API. Exposes window.__pix so an assistant driving the browser can run a command and get {stdout, exitCode} back, instead of typing at a terminal widget and screen-scraping the result. Rides the session already authenticated in this browser; opens no port and stores no credential.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/PiConnectClaudeBridge
@@ -423,7 +423,7 @@
       return { ok: problems.length === 0, problems: problems, status: api.status(), events: state.events.slice(-12) };
     },
 
-    version: '0.2.0'
+    version: '0.2.1'
   };
 
   window.__pix = api;
@@ -496,7 +496,14 @@
         });
     };
 
-    ws.onclose = function () { if (opened) note('sidecar', 'disconnected'); scheduleReconnect(); };
+    ws.onclose = function (ev) {
+      // 4001 means another Pi Connect tab already holds the bridge. Retrying hard would produce
+      // the ping-pong described in hub.js, so back off to a slow poll: this tab takes over within
+      // half a minute of the holder going away, and stays quiet until then.
+      if (ev && ev.code === 4001) { note('sidecar', 'standing by, another tab holds it'); backoff = 30000; }
+      else if (opened) note('sidecar', 'disconnected');
+      scheduleReconnect();
+    };
     ws.onerror = function () { try { ws.close(); } catch (e) { /* already closing */ } };
   }
 

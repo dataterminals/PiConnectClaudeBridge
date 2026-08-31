@@ -77,9 +77,18 @@ export function createHub(opts = {}) {
     }
 
     if (client && client.readyState === 1) {
-      // A second Pi Connect tab. Prefer the newest, or two tabs would race for every reply.
-      log('a newer page connected; dropping the previous one');
-      try { client.close(4000, 'superseded by a newer tab'); } catch { /* already gone */ }
+      // A second Pi Connect tab. The first version of this preferred the *newest* and closed the
+      // incumbent — which turned two open tabs into an infinite ping-pong: each one is dropped,
+      // reconnects a second later, drops the other, forever. Observed live: a page's event log
+      // read connected/disconnected/connected/disconnected without end, and any command would
+      // land on whichever tab happened to hold the slot at that instant.
+      //
+      // So the incumbent keeps the slot and newcomers are told to stand by. They retry slowly and
+      // take over within ~30s of the holder going away, which is stable and needs no coordination
+      // between tabs.
+      log('another page is already attached; asking the newcomer to stand by');
+      ws.close(4001, 'another page already holds the bridge');
+      return;
     }
     client = ws;
     clientInfo = null;

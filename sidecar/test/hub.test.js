@@ -93,16 +93,34 @@ test('fails a call with a useful message when no page is connected', async () =>
   await assert.rejects(() => hub.call('run', { command: 'x' }), /no Pi Connect page is connected/);
 });
 
-// Two Pi Connect tabs would otherwise both answer every request and race.
-test('keeps only the newest page', async () => {
+// Two Pi Connect tabs would otherwise both answer every request and race. Preferring the newest
+// is worse than it sounds: it makes each tab evict the other on a loop, forever. The incumbent
+// keeps the slot instead, and this is the test that pins that.
+test('keeps the incumbent page and stands newcomers by', async () => {
   const first = fakePage(() => 'from first');
   await opened(first);
   await sleep(50);
-  const closedCode = new Promise((res) => first.once('close', (c) => res(c)));
+
+  const second = fakePage(() => 'from second');
+  const secondClosed = new Promise((res) => second.once('close', (c) => res(c)));
+  assert.strictEqual(await secondClosed, 4001, 'the newcomer should be told to stand by');
+
+  // The incumbent must be untouched and still serving.
+  assert.strictEqual(await hub.call('tail', {}), 'from first');
+  first.close();
+  await sleep(50);
+});
+
+test('a standby page can take over once the holder leaves', async () => {
+  const first = fakePage(() => 'from first');
+  await opened(first);
+  await sleep(50);
+  first.close();
+  await sleep(80);
+
   const second = fakePage(() => 'from second');
   await opened(second);
-  await sleep(80);
-  assert.strictEqual(await closedCode, 4000);
+  await sleep(50);
   assert.strictEqual(await hub.call('tail', {}), 'from second');
   second.close();
   await sleep(50);
