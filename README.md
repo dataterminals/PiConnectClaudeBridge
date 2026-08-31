@@ -166,6 +166,20 @@ happened to run the command in and silently will not load anywhere else:
 claude mcp add -s user pi-connect -- node "/absolute/path/to/PiConnectClaudeBridge/sidecar/src/server.js"
 ```
 
+**In Windows PowerShell**, `claude` resolves to `claude.ps1`, and the parameter binder consumes the
+bare `--` before the script ever sees it — so the `node ...` part arrives as ordinary arguments to
+`mcp add` rather than as the command to run, and the server is registered with nothing to launch.
+Quote the separator to get it through:
+
+```powershell
+claude mcp add -s user pi-connect '--' node "/absolute/path/to/PiConnectClaudeBridge/sidecar/src/server.js"
+```
+
+Only `--` is eaten; `-s` and the rest pass through untouched. The stop-parsing token `--%` does
+*not* help here: it applies only to native commands, so against a `.ps1` shim it survives as a
+literal argument and everything after it collapses into a single string. `claude.cmd --% ...` does
+work, since that one is native.
+
 MCP servers are launched when a session starts, so restart Claude Code before the `pi_*` tools
 appear.
 
