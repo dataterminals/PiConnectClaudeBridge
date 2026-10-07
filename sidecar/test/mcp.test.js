@@ -4,7 +4,9 @@
 //   node test/mcp.test.js
 
 import assert from 'node:assert';
+import http from 'node:http';
 import { spawn } from 'node:child_process';
+import { WebSocket } from 'ws';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -72,49 +74,120 @@ test('says so plainly when no page is connected', async () => {
   assert.match(r.result.content[0].text, /no Pi Connect page is connected/);
 });
 
-// A busy port used to kill the process outright, so the MCP client saw only "Connection closed"
-// with no mention of a port. Hit for real: an orphaned sidecar outlived its session and the next
-// one could not start. A tool that cannot work must still be able to say why.
-test('still serves MCP when the port is already taken, and says so', async () => {
-  const squatter = spawn(process.execPath, [SERVER, '--port', String(PORT)], { stdio: 'ignore' });
+// ---- several sessions, one port ---------------------------------------------
+//
+// Every Claude Code session starts a sidecar, and only one can hold the port. A busy port first
+// killed the process outright ("Connection closed", no reason given), and later left its tools
+// able only to say the port was taken. Seen 2026-10-07: an idle session held the hub for hours,
+// and no other session could reach the Pi. Now the others relay through the holder and take over
+// when it exits. These run real server.js processes on their own port.
+
+const PORT2 = 8795;
+
+/** A sidecar process with an MCP client attached to its stdio, already initialised. */
+async function sidecar(extra = []) {
+  const proc = spawn(process.execPath, [SERVER, '--port', String(PORT2), '--retry-ms', '300', ...extra], {
+    stdio: ['pipe', 'pipe', 'ignore']
+  });
+  let buf = '';
+  const waiting = new Map();
+  proc.stdout.on('data', (c) => {
+    buf += c.toString();
+    let i;
+    while ((i = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      let m; try { m = JSON.parse(line); } catch { continue; }
+      const w = waiting.get(m.id);
+      if (w) { waiting.delete(m.id); w(m); }
+    }
+  });
+  let id = 0;
+  const call = (method, params) => new Promise((resolve, reject) => {
+    const n = ++id;
+    waiting.set(n, resolve);
+    setTimeout(() => reject(new Error('no reply to ' + method)), 15000);
+    proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: n, method, params }) + '\n');
+  });
+  await call('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '0' } });
+  proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+  return { proc, tool: (name, args = {}) => call('tools/call', { name, arguments: args }).then((r) => r.result) };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Whatever answers /health on PORT2, or null. */
+async function holder() {
+  try { return await (await fetch('http://127.0.0.1:' + PORT2 + '/health')).json(); } catch { return null; }
+}
+
+async function until(what, fn, ms = 5000) {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() - t0 > ms) throw new Error('timed out waiting for ' + what);
+    await sleep(50);
+  }
+}
+
+/** The userscript's side of the link, attached to whichever sidecar holds PORT2. */
+function fakePage(handler) {
+  const ws = new WebSocket('ws://127.0.0.1:' + PORT2 + '/pix', { origin: 'https://connect.raspberrypi.com' });
+  ws.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    ws.send(JSON.stringify({ id: msg.id, ok: true, result: handler(msg) }));
+  });
+  return new Promise((res, rej) => { ws.once('open', () => res(ws)); ws.once('error', rej); });
+}
+
+const ranOn = (who) => (msg) => msg.method === 'run'
+  ? { ok: true, exitCode: 0, stdout: 'ran ' + msg.params.command + ' via ' + who, ms: 1 }
+  : { ok: true, problems: [] };
+
+test('a second session\'s sidecar relays through the first', async () => {
+  const first = await sidecar();
+  const second = await sidecar();
   try {
-    await new Promise((r) => setTimeout(r, 1200));      // let the squatter claim the port
+    assert.strictEqual((await holder()).pid, first.proc.pid, 'the first sidecar should hold the port');
+    const page = await fakePage(ranOn('the page'));
+    await sleep(100);
 
-    const second = spawn(process.execPath, [SERVER, '--port', String(PORT)], {
-      stdio: ['pipe', 'pipe', 'ignore']
-    });
-    try {
-      let buf2 = '';
-      const reply = (id) => new Promise((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error('no reply')), 8000);
-        second.stdout.on('data', (c) => {
-          buf2 += c.toString();
-          for (const line of buf2.split('\n')) {
-            if (!line.trim()) continue;
-            let m; try { m = JSON.parse(line); } catch { continue; }
-            if (m.id === id) { clearTimeout(t); resolve(m); }
-          }
-        });
-      });
-      const send = (id, method, params) =>
-        second.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    const r = await second.tool('pi_run', { command: 'uptime' });
+    assert.notStrictEqual(r.isError, true, r.content[0].text);
+    assert.match(r.content[0].text, /ran uptime via the page/);
 
-      const initPromise = reply(1);
-      send(1, 'initialize', {
-        protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '0' }
-      });
-      const init = await initPromise;
-      assert.strictEqual(init.result.serverInfo.name, 'pi-connect-bridge',
-        'the server must still come up rather than exiting');
+    const h = await second.tool('pi_health');
+    assert.notStrictEqual(h.isError, true, h.content[0].text);
+    assert.match(JSON.parse(h.content[0].text).holder, new RegExp('another sidecar \\(pid ' + first.proc.pid));
+    page.close();
+  } finally { second.proc.kill(); first.proc.kill(); await sleep(200); }
+});
 
-      const healthPromise = reply(2);
-      send(2, 'tools/call', { name: 'pi_health', arguments: {} });
-      const h = await healthPromise;
-      assert.strictEqual(h.result.isError, true);
-      assert.match(h.result.content[0].text, /already holds it/);
-      assert.match(h.result.content[0].text, new RegExp(String(PORT)));
-    } finally { second.kill(); }
-  } finally { squatter.kill(); }
+test('when the first sidecar\'s session ends, the second takes over the port', async () => {
+  const first = await sidecar();
+  const second = await sidecar();
+  try {
+    first.proc.kill();
+    await until('the second sidecar to hold the port', async () => (await holder())?.pid === second.proc.pid);
+    const page = await fakePage(ranOn('the second sidecar'));
+    await sleep(100);
+    const r = await second.tool('pi_run', { command: 'id' });
+    assert.match(r.content[0].text, /ran id via the second sidecar/);
+    page.close();
+  } finally { second.proc.kill(); first.proc.kill(); await sleep(200); }
+});
+
+test('a port held by something that is not a sidecar is explained', async () => {
+  const stranger = http.createServer((req, res) => { res.writeHead(404); res.end(); });
+  await new Promise((r) => stranger.listen(PORT2, '127.0.0.1', r));
+  const s = await sidecar();
+  try {
+    const h = await s.tool('pi_health');
+    assert.strictEqual(h.isError, true);
+    assert.match(h.content[0].text, /does not answer like another Pi Connect sidecar/);
+    assert.match(h.content[0].text, new RegExp(String(PORT2)));
+  } finally { s.proc.kill(); await new Promise((r) => stranger.close(r)); }
 });
 
 (async () => {

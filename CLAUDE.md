@@ -65,8 +65,11 @@ await __pix.run(multiLineScript, { timeout: 60000 })
 
 7. **No command runs on its own.** No keepalive, no polling of the device, no command replay.
    Every byte sent to the Pi must originate in an explicit call the caller made. A bridge that
-   runs commands by itself is not something a user can reason about. The single automatic
-   behaviour in the whole system is the sidecar link. It retries a loopback socket on a backoff,
+   runs commands by itself is not something a user can reason about. Two things in the whole
+   system happen automatically, and both stay on loopback. One is a sidecar that finds
+   127.0.0.1:8732 taken: it tries to bind the port again every few seconds, so another takes over
+   when the holder exits. Binding a port sends nothing to anyone. The other is the sidecar link.
+   It retries a loopback socket on a backoff,
    tries again at once when the page's shell comes up, and tells the hub about the page: a
    `hello` on connect, and a `status` whenever the shell opens or closes, so the hub can choose
    which tab holds the bridge. All of it reaches only 127.0.0.1. It carries requests *in*, sends
@@ -118,8 +121,19 @@ sanitiser games, no tab focus, real tool schemas.
     against a malicious web page — it is *not* protection against a native process on the
     machine, which can send any header. Do not widen the allowlist, and do not bind 0.0.0.0.
 
-13. **`POST /run` is for native programs, never web pages.** It is the one HTTP route that does
-    something. It refuses any request with an `Origin` header, a `Host` other than the loopback
-    address itself, or a body that isn't `application/json`, and `sidecar/test/hub.test.js` has a
-    test for each guard. Don't relax them, and don't give the route CORS headers. Runs from
-    `pi_run` and `/run` go through `hub.run()`, which queues them: both type into one PTY.
+13. **`POST /run` and `POST /call` are for native programs, never web pages.** They are the only
+    HTTP routes that do something. Both go through `readNative()` in hub.js, which refuses any
+    request with an `Origin` header, a `Host` other than the loopback address itself, or a body
+    that isn't `application/json`, and `sidecar/test/hub.test.js` has a test for each guard on each
+    route. Don't relax them, don't give the routes CORS headers, and don't add methods to `/call`
+    that no tool uses. Runs from `pi_run` and `/run` go through `hub.run()`, which queues them:
+    both type into one PTY. That's why `run` isn't a `/call` method.
+
+14. **Every session's sidecar works, and exactly one holds the port.** A sidecar that can't bind
+    127.0.0.1:8732 relays its tools through the one that did (`/run`, `/call`) and keeps retrying
+    the port (`relay.js`). When the holder's session ends, another sidecar takes over within
+    seconds, and the page reconnects on its own backoff. Don't make a busy port fatal again, and
+    never let a sidecar kill or displace the holder: a session mid-command would lose it.
+    `GET /health` names the holder's `pid` and `parentPid`, and the parent is the Claude Code
+    process whose session owns it. `sidecar/test/relay.test.js` and `mcp.test.js` pin the relay,
+    the takeover and the race between two sidecars.

@@ -6,18 +6,28 @@
 // Pi Connect page is open, every tool fails with a message saying exactly that, which is the
 // honest answer — there is no shell to run against.
 //
+// Every Claude Code session starts one of these, and only one can hold the port. The others
+// relay through it and take over when it exits (relay.js), so the tools work in every session.
+//
 // stdout is reserved for the MCP protocol. Anything human-readable goes to stderr.
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createHub, describeStartupFailure, DEFAULT_PORT } from './hub.js';
+import { createHub, DEFAULT_PORT } from './hub.js';
+import { createRelay } from './relay.js';
 
 const argv = process.argv.slice(2);
-const portArg = argv.indexOf('--port');
-const port = portArg !== -1 ? Number(argv[portArg + 1]) : Number(process.env.PIX_PORT || DEFAULT_PORT);
+const flag = (name, env, fallback) => {
+  const i = argv.indexOf(name);
+  return i !== -1 ? Number(argv[i + 1]) : Number(process.env[env] || fallback);
+};
+const port = flag('--port', 'PIX_PORT', DEFAULT_PORT);
+const retryMs = flag('--retry-ms', 'PIX_RETRY_MS', 3000);
 
-const hub = createHub({ port, log: (m) => process.stderr.write('[pix] ' + m + '\n') });
+const log = (m) => process.stderr.write('[pix] ' + m + '\n');
+const hub = createHub({ port, log });
+const relay = createRelay({ hub, retryMs, log });
 
 const TOOLS = [
   {
@@ -137,31 +147,28 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const timeout = a.timeout_ms || 30000;
         // Give the page a little longer than the command, so a slow command comes back as a
         // proper timed-out result rather than as a dead transport.
-        const r = await hub.run({ command: a.command, timeout, shell: a.shell }, timeout + 15000);
+        const r = await relay.run({ command: a.command, timeout, shell: a.shell }, timeout + 15000);
         return renderRun(r);
       }
       case 'pi_send':
-        await hub.call('send', { text: a.text });
+        await relay.call('send', { text: a.text });
         return text('sent ' + JSON.stringify(a.text));
       case 'pi_key':
-        await hub.call('key', { key: a.key });
+        await relay.call('key', { key: a.key });
         return text('sent key ' + a.key);
       case 'pi_expect': {
-        const r = await hub.call('expect', { pattern: a.pattern, timeout: a.timeout_ms || 15000 },
-                                 (a.timeout_ms || 15000) + 15000);
+        const r = await relay.call('expect', { pattern: a.pattern, timeout: a.timeout_ms || 15000 },
+                                   (a.timeout_ms || 15000) + 15000);
         return r.matched
           ? text('matched ' + JSON.stringify(r.match) + '\n\n' + r.text)
           : failure('pattern never appeared within the timeout. Seen since waiting began:\n\n' + r.text);
       }
       case 'pi_tail':
-        return text(await hub.call('tail', { chars: a.chars || 2000 }));
+        return text(await relay.call('tail', { chars: a.chars || 2000 }));
       case 'pi_screen':
-        return text((await hub.call('screen', {})) || '(no terminal widget on the page)');
-      case 'pi_health': {
-        if (startupError) return failure(describeStartupFailure(startupError, port));
-        const h = await hub.call('health', {});
-        return text(JSON.stringify({ attachedPage: hub.info(), bridge: h }, null, 2));
-      }
+        return text((await relay.call('screen', {})) || '(no terminal widget on the page)');
+      case 'pi_health':
+        return text(JSON.stringify(await relay.health(), null, 2));
       default:
         return failure('unknown tool: ' + name);
     }
@@ -170,27 +177,24 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// Start the MCP transport even if the listener could not bind.
+// Start the MCP transport whatever happens to the port.
 //
 // The first version awaited hub.listen() first and let a failure take the process down. A busy
 // port therefore produced no MCP server at all, and the client reported only "Connection closed"
-// — no port, no reason, nothing to act on. An unusable tool that can still say why it is unusable
-// beats one that vanishes, so binding failures are carried into every tool result and pi_health.
-let startupError = null;
-try {
-  await hub.listen();
-} catch (e) {
-  startupError = e;
-  process.stderr.write('[pix] ' + describeStartupFailure(e, port) + '\n');
-}
+// — no port, no reason, nothing to act on. Then a busy port left the tools able only to say so.
+// Now a busy port is ordinary: this sidecar relays through whoever holds it, and claims it when
+// they leave. A port held by something that isn't a sidecar is explained by pi_health.
+await relay.start();
 
 await server.connect(new StdioServerTransport());
-process.stderr.write('[pix] MCP server ready' + (startupError ? ' (degraded: no loopback listener)' : '') + '\n');
+log('MCP server ready (' + (relay.isHub() ? 'holding 127.0.0.1:' + port
+                                           : 'relaying through whatever holds 127.0.0.1:' + port) + ')');
 
 let shuttingDown = false;
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  relay.stop();
   try { await hub.close(); } catch { /* going away regardless */ }
   process.exit(0);
 }

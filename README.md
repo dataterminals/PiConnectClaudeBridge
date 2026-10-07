@@ -131,10 +131,11 @@ interrupting is one it started itself. Pass `{ interruptOnTimeout: false }` to l
 * **No UI.** It renders nothing, binds no hotkey, and changes nothing you can see. It defines
   `window.__pix` and stops.
 * **No command runs by itself.** No keepalive, no polling of the device, no command replay. Every
-  byte sent to the Pi originates in an explicit `__pix` call. The one automatic behaviour anywhere
-  in this repo is the optional sidecar link retrying a loopback socket on a backoff; it carries
-  requests *in*, reaches only `127.0.0.1`, and stops entirely if you set
-  `localStorage.__pixNoSidecar = '1'`.
+  byte sent to the Pi originates in an explicit `__pix` call. Two things in this repo happen
+  automatically, both on loopback. The optional sidecar link retries a loopback socket on a
+  backoff. It carries requests *in*, reaches only `127.0.0.1`, and stops entirely if you set
+  `localStorage.__pixNoSidecar = '1'`. And a sidecar that finds its port taken tries to bind it
+  again every few seconds, which sends nothing to anyone.
 * **No credentials, ever.** It reads no cookie, no token, and no password. It attaches to a
   transport the page had already built.
 * **No new exposure.** It opens no port and changes no config on the Pi. Anything you can do
@@ -253,15 +254,36 @@ web page can't send one without it. It also refuses a `Host` other than `127.0.0
 stops DNS rebinding) and any body that isn't `application/json`. A native process can forge all
 three. That's accepted: it already runs as you, with more reach than the hub has.
 
-`/run` is served by whichever sidecar holds port 8732. With several Claude Code sessions open,
-that's the one that started first.
+`POST /call` carries the other tools the same way, as `{"method":"tail","params":{"chars":500}}`,
+answered with `{"ok":true,"result":...}`. It takes `send`, `key`, `expect`, `tail`, `screen` and
+`health`, and nothing else; runs go to `/run`, where they queue. Same three guards.
+
+### Several Claude Code sessions
+
+Every session starts its own sidecar, and only one of them can hold port 8732. The others relay
+their tools through it over `/run` and `/call`, so `pi_*` works in every session. They also try
+the port again every 3 seconds. When the holder's session ends, whichever sidecar retries first
+takes the port, and the Pi Connect tab reconnects to it on its own (it retries after 1s, 2s, 4s
+and so on). The gap is a few seconds. Anything using `/run` directly, such as another MCP server,
+sees the same hub at the same address before and after.
+
+`pi_health` says which sidecar holds the port, and so does `curl http://127.0.0.1:8732/health`.
+It gives the holder's `pid` and `parentPid`, and the parent is the Claude Code process it belongs
+to.
+
+Until 2026-10-07 the first session to start held the port for as long as it lived, and every
+other session's tools could only report that the port was taken. When that session closed,
+nothing took over until a new session started. A sidecar from before the change still serves
+`/run` but has no `/call`. While one holds the port, `pi_run` works through it, `pi_health` still
+shows who holds it, and the other tools say to restart the session it belongs to.
 
 ## Tests
 
 ```bash
 npm test                    # everything
 node tests/protocol.test.js # the userscript, against a fake PTY
-cd sidecar && npm test      # the hub: preflight, origin rules, which tab holds the bridge, MCP
+cd sidecar && npm test      # the hub: preflight, origin rules, which tab holds the bridge,
+                            # which sidecar holds the port, MCP
 ```
 
 The userscript suite runs the real script against a fake PTY that is unhelpful in the same ways a
@@ -281,6 +303,7 @@ cd sidecar && node test/live-e2e.js
 ```
 src/pi-connect-claude-bridge.user.js   the bridge itself
 sidecar/src/hub.js                     loopback WebSocket hub (PNA preflight, origin allowlist)
+sidecar/src/relay.js                   sidecars that don't hold the port relay through the one that does
 sidecar/src/server.js                  MCP stdio server
 docs/protocol.md                       the reverse-engineered wire protocol, with measurements
 tests/ and sidecar/test/               offline regression tests

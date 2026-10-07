@@ -340,6 +340,64 @@ test('/run says why when no page is connected', async () => {
   assert.match((await res.json()).error, /no Pi Connect page is connected/);
 });
 
+// POST /call carries the other tools for a sidecar relaying through this one. It is as powerful
+// as /run (pi_send types into the terminal), so it gets the same guards and the same tests.
+const postCall = (body, headers = {}) =>
+  fetch(BASE + '/call', { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
+
+test('/call relays a tool call to the page and wraps the result', async () => {
+  const ws = fakePage((msg) => ({ method: msg.method, got: msg.params }));
+  await opened(ws);
+  await sleep(50);
+  const res = await postCall({ method: 'tail', params: { chars: 10 } });
+  assert.strictEqual(res.status, 200);
+  const r = await res.json();
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(r.result, { method: 'tail', got: { chars: 10 } });
+  ws.close();
+  await sleep(50);
+});
+
+test('/call refuses anything carrying an Origin, the Pi Connect origin included', async () => {
+  for (const o of ['https://evil.example', ORIGIN, 'null']) {
+    const res = await postCall({ method: 'tail' }, { Origin: o });
+    assert.strictEqual(res.status, 403, 'Origin ' + o + ' got ' + res.status);
+  }
+});
+
+test('/call refuses a Host that is not this loopback address (DNS rebinding)', async () => {
+  const r = await rawPost('/call', {
+    headers: { 'Host': 'rebind.example:' + PORT, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ method: 'tail' })
+  });
+  assert.strictEqual(r.status, 403);
+});
+
+test('/call refuses GET, non-JSON bodies, and methods it does not carry', async () => {
+  assert.strictEqual((await fetch(BASE + '/call')).status, 405);
+  const form = await fetch(BASE + '/call', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'method=tail'
+  });
+  assert.strictEqual(form.status, 415);
+  // run goes to /run, where runs queue; resize and clear have no tool behind them.
+  for (const method of ['run', 'resize', 'clear', undefined]) {
+    assert.strictEqual((await postCall({ method })).status, 400, 'method ' + method);
+  }
+});
+
+test('/call says why when no page is connected', async () => {
+  const res = await postCall({ method: 'health' });
+  assert.strictEqual(res.status, 503);
+  assert.match((await res.json()).error, /no Pi Connect page is connected/);
+});
+
+// Which process holds the port, and so which session: finding that by hand took an hour.
+test('/health names the process that holds the port', async () => {
+  const body = await (await fetch(BASE + '/health')).json();
+  assert.strictEqual(body.pid, process.pid);
+  assert.strictEqual(body.parentPid, process.ppid);
+});
+
 // Both pi_run and /run type into one terminal, so they have to take turns.
 test('runs take turns, never overlap', async () => {
   let inFlight = 0, most = 0;

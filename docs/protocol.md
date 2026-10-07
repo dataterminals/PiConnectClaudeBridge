@@ -242,3 +242,31 @@ popup is blocked, it falls back to `location.href = href`. Both routes load the 
 visiting a shell page in place. It would also leave the other failure open: a shell window whose
 session has ended still holds the slot while a live one waits. Keying on the shell covers both
 cases and needs no list of URLs.
+
+## 4. Which sidecar holds the port
+
+Section 3 is about pages. This one is about the other end: every Claude Code session starts a
+sidecar, and only one process can listen on `127.0.0.1:8732`.
+
+The one that binds it is the hub, and the page connects to it. Each of the others relays its
+tools through the hub over two loopback routes, both closed to browsers by the same three guards
+(no `Origin`, loopback `Host` only, `application/json` bodies only):
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /run` | `{"command", "timeout"?, "shell"?}` | the `run()` result, queued behind other runs |
+| `POST /call` | `{"method", "params"?, "timeout"?}` with `method` one of `send`, `key`, `expect`, `tail`, `screen`, `health` | `{"ok": true, "result": ...}` |
+
+Either route answers a failure with a non-200 status and `{"ok": false, "error": "..."}`.
+
+A sidecar that relays also tries to bind the port every 3 seconds. When the hub's session ends,
+its listening socket closes, and the first sidecar to retry becomes the hub. The page has lost its
+socket at the same moment, and it reconnects with its usual backoff (1s, 2s, 4s, up to 30s), so it
+finds the new hub within a few seconds. A tool call that lands in the gap finds nobody on the
+port. It claims the port itself, or, if another sidecar won that race, retries once against the
+winner.
+
+`GET /health` answers `{"ok", "connected", "page", "pid", "parentPid"}`. `pid` is the hub's
+process, and `parentPid` is the Claude Code process whose session started it. Sidecars from
+before this change send neither field, and answer `/call` with `426` like any route they don't
+know.

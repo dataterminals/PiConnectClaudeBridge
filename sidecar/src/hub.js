@@ -26,16 +26,17 @@ export const WS_PATH = '/pix';
 /**
  * Turn a startup failure into something a person can act on.
  *
- * A busy port is overwhelmingly the common case, and it has one overwhelmingly common cause: an
- * earlier sidecar that never exited. Saying "EADDRINUSE" and stopping would leave the reader to
- * work that out; a tool that cannot run should still explain itself.
+ * Another sidecar holding the port is normal and never reaches this: relay.js routes through it.
+ * What does reach it is a port held by something that does not answer like a hub. Saying
+ * "EADDRINUSE" and stopping would leave the reader to work out what; a tool that cannot run
+ * should still explain itself.
  */
 export function describeStartupFailure(err, port) {
   if (err && err.code === 'EADDRINUSE') {
-    return 'the sidecar could not claim 127.0.0.1:' + port + ' because something else already ' +
-      'holds it — almost always an earlier sidecar that outlived its session. Stop that process ' +
-      '(on Windows: netstat -ano | findstr :' + port + ', then taskkill /PID <pid> /F) and ' +
-      'restart, or set PIX_PORT to another port. Note the userscript looks for ' + DEFAULT_PORT +
+    return 'the sidecar could not claim 127.0.0.1:' + port + ', and whatever holds it does not ' +
+      'answer like another Pi Connect sidecar. Find it (on Windows: netstat -ano | findstr :' +
+      port + ') and stop it; this sidecar keeps trying the port and takes it once it is free. ' +
+      'Or set PIX_PORT to another port. Note the userscript looks for ' + DEFAULT_PORT +
       ', so a different port needs the script changed to match.';
   }
   return 'the sidecar could not start its loopback listener: ' + (err && err.message);
@@ -76,11 +77,16 @@ export function createHub(opts = {}) {
     applyCorsHeaders(req, res);
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
     if (req.url === '/health') {
+      // pid and parentPid say which process holds the port, and so which Claude Code session:
+      // its parent. Finding that by hand took an hour of matching process start times against
+      // session creation times (2026-10-07).
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, connected: isConnected(), page: clientInfo }));
+      res.end(JSON.stringify({ ok: true, connected: isConnected(), page: clientInfo,
+                               pid: process.pid, parentPid: process.ppid }));
       return;
     }
     if (req.url === '/run') { handleRun(req, res); return; }
+    if (req.url === '/call') { handleCall(req, res); return; }
     res.writeHead(426, { 'Content-Type': 'text/plain' });
     res.end('Upgrade Required');
   });
@@ -263,29 +269,33 @@ export function createHub(opts = {}) {
     return next;
   }
 
-  // POST /run: the same run as pi_run, for a native program on this machine (another MCP server,
-  // a script) that wants the Pi without going through this process's tools.
+  // POST /run and POST /call: the same calls the pi_* tools make, for a native program on this
+  // machine that wants the Pi without going through this process's tools. That is another MCP
+  // server, a script, or another session's sidecar relaying through this one (relay.js).
   //
-  // Web pages must never reach it, and three guards keep them out. Any one of them is enough:
+  // Web pages must never reach either route, and three guards keep them out. Any one of them is
+  // enough:
   //   - A browser always sends Origin on a POST, and page JavaScript cannot remove it, so any
   //     request carrying an Origin is refused. That includes the Pi Connect page, which holds
   //     the shell already.
   //   - Host must be this loopback address itself, which defeats DNS rebinding.
   //   - The body must be application/json, which a plain HTML form cannot send.
   // A native process can forge all three, and that's accepted: it already runs as the user, with
-  // more reach than this hub grants (CLAUDE.md, rule 12).
-  const RUN_BODY_MAX = 64 * 1024;
+  // more reach than this hub grants (CLAUDE.md, rule 12). Both routes go through readNative(), so
+  // the guards cannot drift apart.
+  const NATIVE_BODY_MAX = 64 * 1024;
 
-  function answerRun(res, status, body) {
+  function answerNative(res, status, body) {
     if (res.headersSent) return;
     res.writeHead(status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(body));
   }
 
-  function handleRun(req, res) {
-    const refuse = (status, error) => answerRun(res, status, { ok: false, error });
+  /** Apply the guards, then hand the parsed JSON body to `then`, or answer the refusal. */
+  function readNative(req, res, route, then) {
+    const refuse = (status, error) => answerNative(res, status, { ok: false, error });
     if (req.method !== 'POST') return refuse(405, 'POST only');
-    if (req.headers.origin !== undefined) return refuse(403, 'browsers may not call /run');
+    if (req.headers.origin !== undefined) return refuse(403, 'browsers may not call ' + route);
     const host = String(req.headers.host || '').toLowerCase();
     if (host !== '127.0.0.1:' + port && host !== 'localhost:' + port) {
       return refuse(403, 'Host must be 127.0.0.1:' + port);
@@ -298,14 +308,21 @@ export function createHub(opts = {}) {
     let size = 0;
     req.on('data', (c) => {
       size += c.length;
-      if (size > RUN_BODY_MAX) { refuse(413, 'body over ' + RUN_BODY_MAX + ' bytes'); req.destroy(); }
+      if (size > NATIVE_BODY_MAX) { refuse(413, 'body over ' + NATIVE_BODY_MAX + ' bytes'); req.destroy(); }
       else chunks.push(c);
     });
-    req.on('end', async () => {
+    req.on('end', () => {
       if (res.headersSent) return;
       let body;
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return refuse(400, 'the body is not JSON'); }
-      if (!body || typeof body.command !== 'string' || !body.command) {
+      if (!body || typeof body !== 'object') return refuse(400, 'the body must be a JSON object');
+      then(body, refuse);
+    });
+  }
+
+  function handleRun(req, res) {
+    readNative(req, res, '/run', async (body, refuse) => {
+      if (typeof body.command !== 'string' || !body.command) {
         return refuse(400, 'command (a non-empty string) is required');
       }
       const timeout = Number.isFinite(body.timeout) && body.timeout > 0 ? body.timeout : 30000;
@@ -313,7 +330,29 @@ export function createHub(opts = {}) {
         // As pi_run does: the page gets longer than the command, so a slow command comes back
         // as a timed-out result rather than a dead transport.
         const result = await run({ command: body.command, timeout, shell: body.shell }, timeout + 15000);
-        answerRun(res, 200, result);
+        answerNative(res, 200, result);
+      } catch (e) {
+        refuse(503, e.message);
+      }
+    });
+  }
+
+  // POST /call: the rest of the tools, { method, params, timeout }, answered { ok, result }.
+  // Only the methods the pi_* tools use. `run` stays on /run, where runs queue for the one
+  // terminal; the page's other methods (clear, resize, raw) have no tool and no caller.
+  const CALL_METHODS = ['send', 'key', 'expect', 'tail', 'screen', 'health'];
+  const CALL_TIMEOUT_MAX = 10 * 60 * 1000;
+
+  function handleCall(req, res) {
+    readNative(req, res, '/call', async (body, refuse) => {
+      if (!CALL_METHODS.includes(body.method)) {
+        return refuse(400, 'method must be one of ' + CALL_METHODS.join(', ') + '; runs go to /run');
+      }
+      const params = body.params && typeof body.params === 'object' ? body.params : {};
+      const timeout = Number.isFinite(body.timeout) && body.timeout > 0
+        ? Math.min(body.timeout, CALL_TIMEOUT_MAX) : 45000;
+      try {
+        answerNative(res, 200, { ok: true, result: await call(body.method, params, timeout) });
       } catch (e) {
         refuse(503, e.message);
       }
@@ -323,14 +362,22 @@ export function createHub(opts = {}) {
   // `ws` re-emits the HTTP server's errors on itself, and an 'error' event with no listener is a
   // throw. Without this, a busy port took down the whole process -- including the MCP server that
   // had not started yet -- and the caller saw only "Connection closed" with no hint of a port.
-  wss.on('error', (e) => { lastError = e; log('websocket server error: ' + e.message); });
+  // A busy port is not logged here: listen() rejects with it, and relay.js retries it every few
+  // seconds, which would otherwise print the same line forever.
+  wss.on('error', (e) => {
+    lastError = e;
+    if (e.code !== 'EADDRINUSE') log('websocket server error: ' + e.message);
+  });
 
+  // Safe to call again after it fails: Node lets a server retry listen() after an error, which
+  // is how a sidecar that started second takes the port over once the holder exits.
   function listen() {
     return new Promise((resolve, reject) => {
       const onError = (e) => { lastError = e; reject(e); };
       httpServer.once('error', onError);
       httpServer.listen(port, '127.0.0.1', () => {      // loopback only, never the LAN
         httpServer.removeListener('error', onError);
+        lastError = null;
         log('listening on 127.0.0.1:' + port);
         resolve();
       });
@@ -345,5 +392,6 @@ export function createHub(opts = {}) {
     return new Promise((resolve) => httpServer.close(resolve));
   }
 
-  return { call, run, listen, close, isConnected, info: () => clientInfo, error: () => lastError, port };
+  return { call, run, listen, close, isConnected, listening: () => httpServer.listening,
+           info: () => clientInfo, error: () => lastError, port };
 }
