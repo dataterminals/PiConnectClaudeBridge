@@ -220,6 +220,28 @@ await navigator.permissions.query({ name: 'local-network-access' })   // 'prompt
 `docs/protocol.md` has the full account, including the Private Network Access preflight the hub
 has to answer and why its absence fails silently.
 
+### Other programs on this machine: `POST /run`
+
+A native program that wants the Pi, such as a script or another MCP server with its own tools,
+can use the same run as `pi_run` without being an MCP client:
+
+```bash
+curl -s http://127.0.0.1:8732/run -H 'Content-Type: application/json' -d '{"command":"uptime","timeout":10000}'
+```
+
+The answer is the `run()` result as JSON: `ok`, `exitCode`, `stdout` and `ms`, plus `timedOut`,
+`markerMissing` or `truncated` when they apply. With no page to run on, the answer is `503` with
+the reason in `error`. `pi_run` and `/run` share one terminal, so their runs queue up and never
+overlap.
+
+Only native programs get in. The hub refuses any request that carries an `Origin` header, and a
+web page can't send one without it. It also refuses a `Host` other than `127.0.0.1:8732` (that
+stops DNS rebinding) and any body that isn't `application/json`. A native process can forge all
+three. That's accepted: it already runs as you, with more reach than the hub has.
+
+`/run` is served by whichever sidecar holds port 8732. With several Claude Code sessions open,
+that's the one that started first.
+
 ## Tests
 
 ```bash

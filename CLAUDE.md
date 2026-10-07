@@ -113,3 +113,9 @@ sanitiser games, no tab focus, real tool schemas.
     Browsers set `Origin` themselves and page JS cannot forge it, so this is real protection
     against a malicious web page — it is *not* protection against a native process on the
     machine, which can send any header. Do not widen the allowlist, and do not bind 0.0.0.0.
+
+13. **`POST /run` is for native programs, never web pages.** It is the one HTTP route that does
+    something. It refuses any request with an `Origin` header, a `Host` other than the loopback
+    address itself, or a body that isn't `application/json`, and `sidecar/test/hub.test.js` has a
+    test for each guard. Don't relax them, and don't give the route CORS headers. Runs from
+    `pi_run` and `/run` go through `hub.run()`, which queues them: both type into one PTY.

@@ -4,6 +4,7 @@
 //   node test/hub.test.js
 
 import assert from 'node:assert';
+import http from 'node:http';
 import { WebSocket } from 'ws';
 import { createHub } from '../src/hub.js';
 
@@ -131,6 +132,100 @@ test('times out a page that never answers', async () => {
   await opened(ws);
   await sleep(50);
   await assert.rejects(() => hub.call('run', { command: 'x' }, 200), /did not answer/);
+  ws.close();
+  await sleep(50);
+});
+
+// POST /run is for native programs on this machine. Each guard gets its own test, because any one
+// of them failing open would let a web page run commands on the Pi.
+
+/** A raw request, so the Host header can be set (fetch won't let a caller choose it). */
+function rawPost(path, { headers = {}, body = '' } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: PORT, path, method: 'POST', headers }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body: data ? JSON.parse(data) : null }));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+const postRun = (body, headers = {}) =>
+  fetch(BASE + '/run', { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
+
+test('/run relays to the page and returns its result', async () => {
+  const ws = fakePage((msg) => ({ ok: true, exitCode: 0, stdout: 'ran ' + msg.params.command, timeout: msg.params.timeout }));
+  await opened(ws);
+  await sleep(50);
+  const res = await postRun({ command: 'uptime', timeout: 5000 });
+  assert.strictEqual(res.status, 200);
+  const r = await res.json();
+  assert.strictEqual(r.stdout, 'ran uptime');
+  assert.strictEqual(r.timeout, 5000);
+  ws.close();
+  await sleep(50);
+});
+
+test('/run refuses anything carrying an Origin, the Pi Connect origin included', async () => {
+  for (const o of ['https://evil.example', ORIGIN, 'null']) {
+    const res = await postRun({ command: 'id' }, { Origin: o });
+    assert.strictEqual(res.status, 403, 'Origin ' + o + ' got ' + res.status);
+  }
+});
+
+test('/run refuses a Host that is not this loopback address (DNS rebinding)', async () => {
+  const r = await rawPost('/run', {
+    headers: { 'Host': 'rebind.example:' + PORT, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command: 'id' })
+  });
+  assert.strictEqual(r.status, 403);
+});
+
+test('/run refuses GET and non-JSON bodies', async () => {
+  assert.strictEqual((await fetch(BASE + '/run')).status, 405);
+  const form = await fetch(BASE + '/run', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'command=id'
+  });
+  assert.strictEqual(form.status, 415);
+  assert.strictEqual((await postRun({ nope: 1 })).status, 400);
+});
+
+test('/run says why when no page is connected', async () => {
+  const res = await postRun({ command: 'id' });
+  assert.strictEqual(res.status, 503);
+  assert.match((await res.json()).error, /no Pi Connect page is connected/);
+});
+
+// Both pi_run and /run type into one terminal, so they have to take turns.
+test('runs take turns, never overlap', async () => {
+  let inFlight = 0, most = 0;
+  const ws = fakePage(async (msg) => {
+    most = Math.max(most, ++inFlight);
+    await sleep(60);
+    inFlight--;
+    return { stdout: msg.params.command };
+  });
+  await opened(ws);
+  await sleep(50);
+  const out = await Promise.all([
+    hub.run({ command: 'a' }, 2000),
+    postRun({ command: 'b' }).then((r) => r.json()),
+    hub.run({ command: 'c' }, 2000)
+  ]);
+  assert.deepStrictEqual(out.map((r) => r.stdout), ['a', 'b', 'c']);
+  assert.strictEqual(most, 1, 'two runs were in flight at once');
+  ws.close();
+  await sleep(50);
+});
+
+test('a failed run does not jam the queue behind it', async () => {
+  const ws = fakePage((msg) => { if (msg.params.command === 'bad') throw new Error('boom'); return { stdout: 'fine' }; });
+  await opened(ws);
+  await sleep(50);
+  await assert.rejects(() => hub.run({ command: 'bad' }, 2000), /boom/);
+  assert.strictEqual((await hub.run({ command: 'ok' }, 2000)).stdout, 'fine');
   ws.close();
   await sleep(50);
 });

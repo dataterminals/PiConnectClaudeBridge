@@ -137,7 +137,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const timeout = a.timeout_ms || 30000;
         // Give the page a little longer than the command, so a slow command comes back as a
         // proper timed-out result rather than as a dead transport.
-        const r = await hub.call('run', { command: a.command, timeout, shell: a.shell }, timeout + 15000);
+        const r = await hub.run({ command: a.command, timeout, shell: a.shell }, timeout + 15000);
         return renderRun(r);
       }
       case 'pi_send':

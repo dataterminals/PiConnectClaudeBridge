@@ -78,6 +78,7 @@ export function createHub(opts = {}) {
       res.end(JSON.stringify({ ok: true, connected: isConnected(), page: clientInfo }));
       return;
     }
+    if (req.url === '/run') { handleRun(req, res); return; }
     res.writeHead(426, { 'Content-Type': 'text/plain' });
     res.end('Upgrade Required');
   });
@@ -172,6 +173,77 @@ export function createHub(opts = {}) {
     });
   }
 
+  /**
+   * Run a command on the page, one at a time.
+   *
+   * Every caller shares one terminal. Two runs in flight at once would type the second command
+   * line into the PTY while the first is still printing, and its echo would land inside the
+   * first one's output. So runs queue here, whether they come from pi_run or from POST /run.
+   */
+  let runChain = Promise.resolve();
+  function run(params, timeoutMs) {
+    const next = runChain.then(() => call('run', params, timeoutMs));
+    runChain = next.catch(() => {});
+    return next;
+  }
+
+  // POST /run: the same run as pi_run, for a native program on this machine (another MCP server,
+  // a script) that wants the Pi without going through this process's tools.
+  //
+  // Web pages must never reach it, and three guards keep them out. Any one of them is enough:
+  //   - A browser always sends Origin on a POST, and page JavaScript cannot remove it, so any
+  //     request carrying an Origin is refused. That includes the Pi Connect page, which holds
+  //     the shell already.
+  //   - Host must be this loopback address itself, which defeats DNS rebinding.
+  //   - The body must be application/json, which a plain HTML form cannot send.
+  // A native process can forge all three, and that's accepted: it already runs as the user, with
+  // more reach than this hub grants (CLAUDE.md, rule 12).
+  const RUN_BODY_MAX = 64 * 1024;
+
+  function answerRun(res, status, body) {
+    if (res.headersSent) return;
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  }
+
+  function handleRun(req, res) {
+    const refuse = (status, error) => answerRun(res, status, { ok: false, error });
+    if (req.method !== 'POST') return refuse(405, 'POST only');
+    if (req.headers.origin !== undefined) return refuse(403, 'browsers may not call /run');
+    const host = String(req.headers.host || '').toLowerCase();
+    if (host !== '127.0.0.1:' + port && host !== 'localhost:' + port) {
+      return refuse(403, 'Host must be 127.0.0.1:' + port);
+    }
+    if (!/^application\/json(\s*;|$)/i.test(String(req.headers['content-type'] || ''))) {
+      return refuse(415, 'send the body as application/json');
+    }
+
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > RUN_BODY_MAX) { refuse(413, 'body over ' + RUN_BODY_MAX + ' bytes'); req.destroy(); }
+      else chunks.push(c);
+    });
+    req.on('end', async () => {
+      if (res.headersSent) return;
+      let body;
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return refuse(400, 'the body is not JSON'); }
+      if (!body || typeof body.command !== 'string' || !body.command) {
+        return refuse(400, 'command (a non-empty string) is required');
+      }
+      const timeout = Number.isFinite(body.timeout) && body.timeout > 0 ? body.timeout : 30000;
+      try {
+        // As pi_run does: the page gets longer than the command, so a slow command comes back
+        // as a timed-out result rather than a dead transport.
+        const result = await run({ command: body.command, timeout, shell: body.shell }, timeout + 15000);
+        answerRun(res, 200, result);
+      } catch (e) {
+        refuse(503, e.message);
+      }
+    });
+  }
+
   // `ws` re-emits the HTTP server's errors on itself, and an 'error' event with no listener is a
   // throw. Without this, a busy port took down the whole process -- including the MCP server that
   // had not started yet -- and the caller saw only "Connection closed" with no hint of a port.
@@ -197,5 +269,5 @@ export function createHub(opts = {}) {
     return new Promise((resolve) => httpServer.close(resolve));
   }
 
-  return { call, listen, close, isConnected, info: () => clientInfo, error: () => lastError, port };
+  return { call, run, listen, close, isConnected, info: () => clientInfo, error: () => lastError, port };
 }
