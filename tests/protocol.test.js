@@ -156,6 +156,17 @@ test('is not fooled by the PTY echoing the marker command back', async () => {
   assert.strictEqual(r.exitCode, 0);
 });
 
+// The interactive bash records the typed line in the user's history like anything else, and the
+// line carries the whole command as base64. A leading space keeps it out wherever HISTCONTROL
+// includes ignorespace, which ignoreboth (the Debian and Raspberry Pi OS default) does.
+test('types its line with a leading space so bash leaves it out of history', async () => {
+  const { win, channel } = connect(() => ({ out: 'ok\r\n', code: 0 }));
+  await win.__pix.run('uname -sm');
+  const typed = channel.sent.join('');
+  assert.ok(typed.startsWith(' printf '), 'the typed line must open with one space: ' +
+            JSON.stringify(typed.slice(0, 20)));
+});
+
 test('passes multi-line scripts and shell metacharacters through untouched', async () => {
   const gnarly = 'echo "it\'s $HOME; `date`"\nfor i in 1 2; do echo $i; done\n';
   let seen = null;

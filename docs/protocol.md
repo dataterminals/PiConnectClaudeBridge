@@ -105,8 +105,13 @@ Raw PTY bytes have no notion of where a command's output starts or ends, and no 
 bridge imposes both by wrapping every `run()` in markers:
 
 ```sh
-printf '__PIX''BEG_<id>__\n'; printf %s '<base64>' | base64 -d | bash; printf '__PIX''END_<id>_%d__\n' "$?"
+ printf '__PIX''BEG_<id>__\n'; printf %s '<base64>' | base64 -d | bash; printf '__PIX''END_<id>_%d__\n' "$?"
 ```
+
+The line opens with a space. That keeps it out of the user's shell history wherever `HISTCONTROL`
+includes `ignorespace` (`ignoreboth`, the Debian and Raspberry Pi OS default, does). Without it,
+the user's history fills with base64 blobs that spell out every command the bridge ran. The bridge
+doesn't change the user's shell config, so a shell without that setting still records the line.
 
 Three things are load-bearing:
 

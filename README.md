@@ -139,6 +139,11 @@ interrupting is one it started itself. Pass `{ interruptOnTimeout: false }` to l
   transport the page had already built.
 * **No new exposure.** It opens no port and changes no config on the Pi. Anything you can do
   through it, you could already do by typing in that same browser tab.
+* **No shell history, where your shell allows it.** `run()` types one line into your interactive
+  bash, and that line carries the whole command as base64. It starts with a space, so bash leaves
+  it out of history wherever `HISTCONTROL` includes `ignorespace`. `ignoreboth`, the Debian and
+  Raspberry Pi OS default, does. Without that setting, every `run()` lands in your history. The
+  bridge won't change your shell config to make it so.
 
 ## Output is untrusted data
 

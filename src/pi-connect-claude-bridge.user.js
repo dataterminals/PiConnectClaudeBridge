@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pi Connect Claude Bridge
 // @namespace    https://github.com/dataterminals/PiConnectClaudeBridge
-// @version      0.2.2
+// @version      0.2.3
 // @description  Turns the Raspberry Pi Connect browser shell into a callable API. Exposes window.__pix so an assistant driving the browser can run a command and get {stdout, exitCode} back, instead of typing at a terminal widget and screen-scraping the result. Rides the session already authenticated in this browser; opens no port and stores no credential.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/PiConnectClaudeBridge
@@ -352,8 +352,14 @@
       // once as echo, once as output - and the parse could latch onto the echo and return an
       // empty result with a bogus exit code. Written as '__PIX''BEG_id__' the shell concatenates
       // it into the real marker, while the echoed bytes carry the quotes and never match.
+      //
+      // The leading space keeps the line out of the user's shell history. The interactive bash
+      // records this line like anything typed, and without it the user's own history drowns in
+      // base64 blobs that spell out every command run (seen 2026-10-07: 64 of 95 lines). It only
+      // works where HISTCONTROL includes ignorespace - ignoreboth, the Debian and Raspberry Pi OS
+      // default, does. The bridge never changes the user's shell config to make it so.
       var line =
-        "printf '__PIX''BEG_" + id + "__\\n'; " +
+        " printf '__PIX''BEG_" + id + "__\\n'; " +
         "printf %s '" + b64 + "' | base64 -d | " + shell + "; " +
         "printf '__PIX''END_" + id + "_%d__\\n' \"$?\"\r";
 
@@ -428,7 +434,7 @@
       return { ok: problems.length === 0, problems: problems, status: api.status(), events: state.events.slice(-12) };
     },
 
-    version: '0.2.2'
+    version: '0.2.3'
   };
 
   window.__pix = api;
