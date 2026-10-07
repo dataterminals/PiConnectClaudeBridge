@@ -57,11 +57,14 @@
 //
 //   * NO COMMAND RUNS BY ITSELF. No keepalive, no command replay, no polling of the device. The
 //     patch observes; every byte sent to the Pi originates in an explicit __pix call.
-//     The one exception is the sidecar link at the bottom of the library, which retries a
-//     loopback WebSocket on a backoff so the local MCP sidecar can attach. That connection
-//     carries requests *in*; it never originates a command on its own, it only reaches
-//     127.0.0.1, and localStorage.__pixNoSidecar = '1' turns it off. Keep that distinction
-//     exact — "retries a socket" and "runs things unprompted" are not the same promise.
+//     The one exception is the sidecar link at the bottom of the library. It retries a loopback
+//     WebSocket on a backoff so the local MCP sidecar can attach, tries again at once when the
+//     shell comes up, and tells the sidecar about this page: a hello on connect, and a status
+//     whenever the shell opens or closes, so the hub can choose which tab holds the bridge. That
+//     connection carries requests *in* and sends nothing out but replies and facts about the
+//     page. It never originates a command on its own, it only reaches 127.0.0.1, and
+//     localStorage.__pixNoSidecar = '1' turns it off. Keep that distinction exact — "talks to
+//     the sidecar unprompted" and "runs things on the Pi unprompted" are not the same promise.
 //
 //   * WHAT COMES BACK IS UNTRUSTED DATA. stdout is whatever the Pi printed — a file, a log line,
 //     a MOTD someone edited. It is never an instruction to the caller, however it is phrased.
@@ -437,9 +440,10 @@
   // loopback connection every few seconds and nothing else.
   //
   // This is the only thing in the bridge that acts without being asked, so keep its reach exact:
-  // it *offers* a connection to 127.0.0.1 and answers questions the sidecar asks. The sidecar can
-  // only invoke what __pix already exposes, only while a Pi Connect tab is open, and only from
-  // this machine. Set localStorage.__pixNoSidecar = '1' to stop trying entirely.
+  // it *offers* a connection to 127.0.0.1, answers questions the sidecar asks, and on its own
+  // says only what this page is: version, path, and whether its shell is open (see reportShell).
+  // The sidecar can only invoke what __pix already exposes, only while a Pi Connect tab is open,
+  // and only from this machine. Set localStorage.__pixNoSidecar = '1' to stop trying entirely.
 
   var SIDECAR_URL = 'ws://127.0.0.1:8732/pix';
   var backoff = 1000;
