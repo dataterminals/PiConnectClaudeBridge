@@ -15,9 +15,13 @@ const WSURL = 'ws://127.0.0.1:' + PORT + '/pix';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** A stand-in for the userscript: answers whatever the hub asks. */
-function fakePage(handler, origin = ORIGIN) {
+/**
+ * A stand-in for the userscript: answers whatever the hub asks. Given `hello`, it introduces
+ * itself on open the way the real one does ({ version, path, shell }).
+ */
+function fakePage(handler, { hello, origin = ORIGIN } = {}) {
   const ws = new WebSocket(WSURL, { origin });
+  if (hello) ws.once('open', () => ws.send(JSON.stringify({ type: 'hello', ...hello })));
   ws.on('message', async (raw) => {
     const msg = JSON.parse(raw.toString());
     try {
@@ -30,6 +34,17 @@ function fakePage(handler, origin = ORIGIN) {
 }
 
 const opened = (ws) => new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
+// Resolves with the close code. Times out instead of hanging, so a page that was wrongly allowed
+// to stay fails the test rather than stalling the whole run.
+const closed = (ws, ms = 2000) => new Promise((res, rej) => {
+  const timer = setTimeout(() => rej(new Error('the page was never closed')), ms);
+  ws.once('close', (code) => { clearTimeout(timer); res(code); });
+});
+const status = (ws, shell) => ws.send(JSON.stringify({ type: 'status', shell }));
+
+const DASHBOARD = { version: '0.2.2', path: '/devices', shell: false };
+const SHELL_A = { version: '0.2.2', path: '/devices/a/remote-shell-session', shell: true };
+const SHELL_B = { version: '0.2.2', path: '/devices/b/remote-shell-session', shell: true };
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -96,7 +111,8 @@ test('fails a call with a useful message when no page is connected', async () =>
 
 // Two Pi Connect tabs would otherwise both answer every request and race. Preferring the newest
 // is worse than it sounds: it makes each tab evict the other on a loop, forever. The incumbent
-// keeps the slot instead, and this is the test that pins that.
+// keeps the slot instead, and this is the test that pins that. (Neither fake page says hello, so
+// this also covers a newcomer that never introduces itself: it is stood by at the deadline.)
 test('keeps the incumbent page and stands newcomers by', async () => {
   const first = fakePage(() => 'from first');
   await opened(first);
@@ -124,6 +140,132 @@ test('a standby page can take over once the holder leaves', async () => {
   await sleep(50);
   assert.strictEqual(await hub.call('tail', {}), 'from second');
   second.close();
+  await sleep(50);
+});
+
+// The bug from 2026-10-06: the userscript runs on every connect.raspberrypi.com page, the /devices
+// dashboard got there first, and it held the bridge with no shell behind it while the real
+// remote-shell window stood by indefinitely.
+test('a page with a live shell takes over from a holder without one', async () => {
+  const dash = fakePage(() => 'from dashboard', { hello: DASHBOARD });
+  await opened(dash);
+  await sleep(50);
+  assert.strictEqual(hub.info().shell, false);
+
+  const dashClosed = closed(dash);
+  const shell = fakePage(() => 'from shell', { hello: SHELL_A });
+  await opened(shell);
+  assert.strictEqual(await dashClosed, 4002, 'the shell-less holder should be told it was replaced');
+  assert.strictEqual(await hub.call('tail', {}), 'from shell');
+  assert.deepStrictEqual(hub.info(), SHELL_A);
+  shell.close();
+  await sleep(50);
+});
+
+// The guard against the ping-pong coming back: the page that lost the slot keeps reconnecting, and
+// none of those attempts may take it back while the holder's shell is alive.
+test('the displaced page cannot win the slot back', async () => {
+  const dash = fakePage(() => 'from dashboard', { hello: DASHBOARD });
+  await opened(dash);
+  await sleep(50);
+  const shell = fakePage(() => 'from shell', { hello: SHELL_A });
+  await opened(shell);
+  await sleep(50);
+
+  for (let i = 0; i < 3; i++) {
+    const again = fakePage(() => 'from dashboard', { hello: DASHBOARD });
+    assert.strictEqual(await closed(again), 4001, 'attempt ' + (i + 1) + ' should stand by');
+  }
+  assert.strictEqual(shell.readyState, WebSocket.OPEN, 'the shell holder must never be dropped');
+  assert.strictEqual(await hub.call('tail', {}), 'from shell');
+  shell.close();
+  await sleep(50);
+});
+
+// First come keeps it between two shell pages. A second device's shell must not grab the bridge
+// out from under a session that is in use.
+test('one shell page never displaces another', async () => {
+  const a = fakePage(() => 'from a', { hello: SHELL_A });
+  await opened(a);
+  await sleep(50);
+  const b = fakePage(() => 'from b', { hello: SHELL_B });
+  assert.strictEqual(await closed(b), 4001);
+  assert.strictEqual(await hub.call('tail', {}), 'from a');
+  a.close();
+  await sleep(50);
+});
+
+test('a page without a shell never displaces anyone', async () => {
+  const dash = fakePage(() => 'from first dashboard', { hello: DASHBOARD });
+  await opened(dash);
+  await sleep(50);
+  const other = fakePage(() => 'from second dashboard', { hello: DASHBOARD });
+  assert.strictEqual(await closed(other), 4001);
+  assert.strictEqual(await hub.call('tail', {}), 'from first dashboard');
+  dash.close();
+  await sleep(50);
+});
+
+// Bridges before 0.2.2 never mention a shell. Unknown is not "none": such a holder could be a
+// working shell page, so it keeps the old first-come behaviour in both directions.
+test('a holder that never reports its shell is not displaced', async () => {
+  const old = fakePage(() => 'from old bridge', { hello: { version: '0.2.1', path: '/devices' } });
+  await opened(old);
+  await sleep(50);
+  const shell = fakePage(() => 'from shell', { hello: SHELL_A });
+  assert.strictEqual(await closed(shell), 4001);
+  assert.strictEqual(await hub.call('tail', {}), 'from old bridge');
+  old.close();
+  await sleep(50);
+});
+
+// The shell comes up after the page attached, which is the normal order: the sidecar link opens
+// at document-start, the WebRTC handshake a second or two later.
+test('a holder whose shell came up afterwards keeps the bridge', async () => {
+  const a = fakePage(() => 'from a', { hello: { ...SHELL_A, shell: false } });
+  await opened(a);
+  await sleep(50);
+  status(a, true);
+  await sleep(50);
+  assert.strictEqual(hub.info().shell, true);
+
+  const b = fakePage(() => 'from b', { hello: SHELL_B });
+  assert.strictEqual(await closed(b), 4001);
+  assert.strictEqual(await hub.call('tail', {}), 'from a');
+  a.close();
+  await sleep(50);
+});
+
+// The same rule covers more than the dashboard: a shell window whose session has ended is just as
+// useless as a holder, and a live one should be able to replace it.
+test('a holder whose shell has closed can be replaced', async () => {
+  const a = fakePage(() => 'from a', { hello: SHELL_A });
+  await opened(a);
+  await sleep(50);
+  status(a, false);
+  await sleep(50);
+  assert.strictEqual(hub.info().shell, false);
+
+  const aClosed = closed(a);
+  const b = fakePage(() => 'from b', { hello: SHELL_B });
+  await opened(b);
+  assert.strictEqual(await aClosed, 4002);
+  assert.strictEqual(await hub.call('tail', {}), 'from b');
+  b.close();
+  await sleep(50);
+});
+
+// A page that is closed mid-call used to leave the caller waiting out the full timeout. A takeover
+// is one more way for the holder to vanish, so the call now fails at once and says why.
+test('a call fails promptly when its page goes away', async () => {
+  const ws = new WebSocket(WSURL, { origin: ORIGIN });      // connects, never replies
+  await opened(ws);
+  await sleep(50);
+  const t0 = Date.now();
+  const call = hub.call('run', { command: 'x' }, 10000);
+  setTimeout(() => ws.close(), 100);
+  await assert.rejects(call, /went away before answering/);
+  assert.ok(Date.now() - t0 < 2000, 'should not have waited for the timeout');
   await sleep(50);
 });
 
@@ -232,7 +374,7 @@ test('a failed run does not jam the queue behind it', async () => {
 
 // ---------------------------------------------------------------------------
 
-const hub = createHub({ port: PORT });
+const hub = createHub({ port: PORT, helloTimeoutMs: 200 });
 
 (async () => {
   await hub.listen();

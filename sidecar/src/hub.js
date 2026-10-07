@@ -46,17 +46,19 @@ export function describeStartupFailure(err, port) {
  * @param {number}   [opts.port]
  * @param {string}   [opts.origin]  the only browser origin allowed to connect
  * @param {function} [opts.log]     called with human-readable status lines
+ * @param {number}   [opts.helloTimeoutMs]  how long a second page has to introduce itself
  */
 export function createHub(opts = {}) {
   const port = opts.port ?? DEFAULT_PORT;
   const origin = opts.origin ?? DEFAULT_ORIGIN;
   const log = opts.log ?? (() => {});
+  const helloTimeoutMs = opts.helloTimeoutMs ?? 2000;
 
   let client = null;          // the one connected page
-  let clientInfo = null;      // whatever it told us about itself on connect
+  let clientInfo = null;      // what it has told us about itself: version, path, shell
   let lastError = null;       // why the hub is not usable, if it is not
   let nextId = 1;
-  const pending = new Map();  // id -> { resolve, reject, timer }
+  const pending = new Map();  // id -> { resolve, reject, timer, ws }
 
   function applyCorsHeaders(req, res) {
     if (req.headers.origin === origin) {
@@ -96,36 +98,37 @@ export function createHub(opts = {}) {
       return;
     }
 
-    if (client && client.readyState === 1) {
-      // A second Pi Connect tab. The first version of this preferred the *newest* and closed the
-      // incumbent — which turned two open tabs into an infinite ping-pong: each one is dropped,
-      // reconnects a second later, drops the other, forever. Observed live: a page's event log
-      // read connected/disconnected/connected/disconnected without end, and any command would
-      // land on whichever tab happened to hold the slot at that instant.
-      //
-      // So the incumbent keeps the slot and newcomers are told to stand by. They retry slowly and
-      // take over within ~30s of the holder going away, which is stable and needs no coordination
-      // between tabs.
-      log('another page is already attached; asking the newcomer to stand by');
-      ws.close(4001, 'another page already holds the bridge');
-      return;
+    // What this page has said about itself. Kept per socket, because a second page's facts are
+    // what decide whether it gets the bridge, before it holds anything.
+    let info = null;
+    let undecided = null;       // a second page's hello deadline; null once its fate is settled
+
+    if (isConnected()) {
+      undecided = setTimeout(() => { undecided = null; standBy(ws); }, helloTimeoutMs);
+    } else {
+      hold(ws, null);
     }
-    client = ws;
-    clientInfo = null;
-    log('page connected');
 
     ws.on('message', (raw) => {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return log('ignored an unparseable frame'); }
 
-      if (msg.type === 'hello') {
-        clientInfo = { version: msg.version, path: msg.path };
-        log('bridge v' + msg.version + ' on ' + msg.path);
+      if (msg.type === 'hello' || msg.type === 'status') {
+        info = readInfo(msg, msg.type === 'hello' ? null : info);
+        if (ws === client) {
+          clientInfo = info;
+          if (msg.type === 'hello') log('bridge v' + info.version + ' on ' + info.path + shellNote(info));
+          else log('the attached page' + shellNote(info));
+        } else if (undecided && msg.type === 'hello') {
+          clearTimeout(undecided);
+          undecided = null;
+          contend(ws, info);
+        }
         return;
       }
 
       const entry = pending.get(msg.id);
-      if (!entry) return;                       // a reply to something that already timed out
+      if (!entry || entry.ws !== ws) return;    // timed out already, or not asked of this page
       pending.delete(msg.id);
       clearTimeout(entry.timer);
       if (msg.ok) entry.resolve(msg.result);
@@ -133,10 +136,82 @@ export function createHub(opts = {}) {
     });
 
     ws.on('close', () => {
+      if (undecided) { clearTimeout(undecided); undecided = null; }
       if (client === ws) { client = null; clientInfo = null; log('page disconnected'); }
+      failCallsTo(ws);
     });
     ws.on('error', (e) => log('socket error: ' + e.message));
   });
+
+  function hold(ws, info) {
+    client = ws;
+    clientInfo = info;
+    log('page connected' + (info ? ': bridge v' + info.version + ' on ' + info.path + shellNote(info) : ''));
+  }
+
+  // A second Pi Connect page, judged on its hello.
+  //
+  // The first version of this preferred the *newest* page and closed the incumbent, which turned
+  // two open tabs into an infinite ping-pong: each one is dropped, reconnects a second later,
+  // drops the other, forever. Observed live: a page's event log read connected/disconnected/
+  // connected/disconnected without end, and any command would land on whichever tab happened to
+  // hold the slot at that instant. So the incumbent keeps the slot and newcomers stand by, retry
+  // slowly, and take over within ~30s of the holder going away.
+  //
+  // That alone let the wrong page win. The userscript runs on every connect.raspberrypi.com page,
+  // so the /devices dashboard attaches too, and when it got there first it held the bridge with
+  // no shell behind it while the real remote-shell window stood by indefinitely (seen 2026-10-06:
+  // pi_health named /devices, "no shell channel", 0 peer connections). Hence the one exception:
+  // a page that reports a live shell replaces a holder that has reported having none.
+  //
+  // That exception cannot ping-pong. A takeover needs the holder to have said "no shell" and the
+  // newcomer to have said "shell". Afterwards the holder has a shell and the displaced page has
+  // none, so it can only win back if the new holder actually loses its shell -- a real event, not
+  // a reconnect. Two shell pages, or two shell-less ones, never displace each other: first come
+  // keeps it. A bridge older than 0.2.2 never mentions its shell, and unknown neither wins nor
+  // loses, which is exactly the old behaviour.
+  function contend(ws, info) {
+    if (!isConnected()) { hold(ws, info); return; }          // the holder left while we waited
+    if (info.shell === true && clientInfo && clientInfo.shell === false) {
+      const displaced = client;
+      log('a page with a live shell (' + info.path + ') takes over from one without (' +
+          clientInfo.path + ')');
+      hold(ws, info);
+      try { displaced.close(4002, 'a page with a live shell took over'); } catch { /* gone */ }
+      return;
+    }
+    standBy(ws);
+  }
+
+  function standBy(ws) {
+    log('another page is already attached; asking the newcomer to stand by');
+    ws.close(4001, 'another page already holds the bridge');
+  }
+
+  // A hello replaces what we knew about a page; a status updates it.
+  function readInfo(msg, prev) {
+    const next = { ...prev };
+    if ('version' in msg) next.version = msg.version;
+    if ('path' in msg) next.path = msg.path;
+    if (typeof msg.shell === 'boolean') next.shell = msg.shell;
+    return next;
+  }
+
+  function shellNote(info) {
+    return info.shell === true ? ', shell open' : info.shell === false ? ', no shell' : '';
+  }
+
+  // A page that goes away mid-call will never answer. Say so now rather than after the timeout.
+  // The command may already have reached the Pi, so this claims nothing about whether it ran.
+  function failCallsTo(ws) {
+    for (const [id, entry] of pending) {
+      if (entry.ws !== ws) continue;
+      pending.delete(id);
+      clearTimeout(entry.timer);
+      entry.reject(new Error('the page holding the bridge went away before answering; ' +
+                             'the command may or may not have run'));
+    }
+  }
 
   function isConnected() { return !!client && client.readyState === 1; }
 
@@ -157,14 +232,15 @@ export function createHub(opts = {}) {
         'and make sure the bridge userscript is installed and enabled.'));
     }
     const id = nextId++;
+    const ws = client;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
         reject(new Error('the page did not answer within ' + timeoutMs + 'ms'));
       }, timeoutMs);
-      pending.set(id, { resolve, reject, timer });
+      pending.set(id, { resolve, reject, timer, ws });
       try {
-        client.send(JSON.stringify({ id, method, params }));
+        ws.send(JSON.stringify({ id, method, params }));
       } catch (e) {
         pending.delete(id);
         clearTimeout(timer);

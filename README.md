@@ -196,8 +196,17 @@ stand by, taking over within ~30s if the holder closes. Whichever window is serv
 `pi_health` — worth a glance if you have shells open to more than one device, because the bridge
 will happily talk to whichever one holds the slot.
 
+A window **without** a live shell never keeps the bridge from one that has one. The userscript
+runs on every Pi Connect page, so the dashboard attaches too, and if it got there first it used to
+hold the bridge with nothing behind it while the real shell window waited. Now the shell window
+takes over as soon as its shell is up, usually within a couple of seconds of opening. The same
+goes for a shell window whose session has ended. Between two windows that both have a shell,
+first come still keeps it.
+
 (An earlier version preferred the newest window instead, which made two open tabs evict each other
-about once a second, forever. Fixed in 0.2.1; `sidecar/test/hub.test.js` pins the behaviour.)
+about once a second, forever. Fixed in 0.2.1. The shell rule needs 0.2.2 on both sides: an older
+userscript never says whether it has a shell, so it neither takes over nor gets displaced.
+`sidecar/test/hub.test.js` and `sidecar/test/handoff.test.js` pin all of it.)
 
 ### The browser will ask permission the first time
 
@@ -247,7 +256,7 @@ that's the one that started first.
 ```bash
 npm test                    # everything
 node tests/protocol.test.js # the userscript, against a fake PTY
-cd sidecar && npm test      # the hub's preflight/origin rules, and the MCP surface
+cd sidecar && npm test      # the hub: preflight, origin rules, which tab holds the bridge, MCP
 ```
 
 The userscript suite runs the real script against a fake PTY that is unhelpful in the same ways a

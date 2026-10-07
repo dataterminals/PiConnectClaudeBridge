@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pi Connect Claude Bridge
 // @namespace    https://github.com/dataterminals/PiConnectClaudeBridge
-// @version      0.2.1
+// @version      0.2.2
 // @description  Turns the Raspberry Pi Connect browser shell into a callable API. Exposes window.__pix so an assistant driving the browser can run a command and get {stdout, exitCode} back, instead of typing at a terminal widget and screen-scraping the result. Rides the session already authenticated in this browser; opens no port and stores no credential.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/PiConnectClaudeBridge
@@ -133,8 +133,10 @@
       // Deliberately not setting binaryType: the app configures its own transport, and this
       // library's job is to observe it, not to reconfigure it out from under the page.
       ch.addEventListener('message', onMessage);
-      ch.addEventListener('close', function () { note('channel', 'shell closed'); });
+      ch.addEventListener('open', reportShell);
+      ch.addEventListener('close', function () { note('channel', 'shell closed'); reportShell(); });
       state.shell = ch;
+      if (ch.readyState === 'open') reportShell();
     } else if (ch.label === 'resize') {
       state.resize = ch;
       // Wrap send only to learn the payload shape the app uses, so resize() can reuse it
@@ -423,7 +425,7 @@
       return { ok: problems.length === 0, problems: problems, status: api.status(), events: state.events.slice(-12) };
     },
 
-    version: '0.2.1'
+    version: '0.2.2'
   };
 
   window.__pix = api;
@@ -441,6 +443,30 @@
 
   var SIDECAR_URL = 'ws://127.0.0.1:8732/pix';
   var backoff = 1000;
+  var retry = null;           // the scheduled reconnect, if there is one
+  var link = null;            // the socket to the sidecar while it is open
+  var told = null;            // the shell state this link last reported
+  var refusedAs = null;       // the shell state the hub judged this tab on when it stood us by
+
+  function shellOpen() { return !!state.shell && state.shell.readyState === 'open'; }
+
+  // Which tab holds the bridge turns on whether it has a live shell (see hub.js), so the sidecar
+  // hears when that changes. Like the rest of this link it reaches only 127.0.0.1, and what it
+  // carries is a fact about this page, never a command to the Pi.
+  function reportShell() {
+    var has = shellOpen();
+    if (link) {
+      if (has === told) return;
+      told = has;
+      try { link.send(JSON.stringify({ type: 'status', shell: has, path: location.pathname })); } catch (e) {}
+    } else if (has && refusedAs === false && retry) {
+      // Stood by for having no shell, and now there is one. The hub lets a page with a shell take
+      // over from a holder without one, so ask again now instead of idling out the 30s. This is
+      // still the same socket retry; it only moves the next attempt earlier.
+      clearTimeout(retry);
+      connectSidecar();
+    }
+  }
 
   function toPattern(p) {
     // A regex source if it parses as one, otherwise hand the raw string to expect(), which
@@ -467,21 +493,28 @@
   }
 
   function scheduleReconnect() {
-    setTimeout(connectSidecar, backoff);
+    retry = setTimeout(connectSidecar, backoff);
     backoff = Math.min(backoff * 2, 30000);
   }
 
   function connectSidecar() {
+    retry = null;
     try { if (localStorage.getItem('__pixNoSidecar') === '1') return; } catch (e) { /* no storage */ }
     var ws;
     try { ws = new WebSocket(SIDECAR_URL); } catch (e) { return scheduleReconnect(); }
     var opened = false;
+    var helloShell = null;
 
     ws.onopen = function () {
       opened = true;
       backoff = 1000;
+      link = ws;
+      refusedAs = null;
+      told = helloShell = shellOpen();
       note('sidecar', 'connected');
-      try { ws.send(JSON.stringify({ type: 'hello', version: api.version, path: location.pathname })); } catch (e) {}
+      try {
+        ws.send(JSON.stringify({ type: 'hello', version: api.version, path: location.pathname, shell: helloShell }));
+      } catch (e) {}
     };
 
     ws.onmessage = function (ev) {
@@ -497,12 +530,24 @@
     };
 
     ws.onclose = function (ev) {
-      // 4001 means another Pi Connect tab already holds the bridge. Retrying hard would produce
-      // the ping-pong described in hub.js, so back off to a slow poll: this tab takes over within
-      // half a minute of the holder going away, and stays quiet until then.
-      if (ev && ev.code === 4001) { note('sidecar', 'standing by, another tab holds it'); backoff = 30000; }
-      else if (opened) note('sidecar', 'disconnected');
+      if (link === ws) link = null;
+      // 4001 means another Pi Connect tab already holds the bridge; 4002 means this tab held it
+      // without a shell and a tab with one took over. Retrying hard would produce the ping-pong
+      // described in hub.js, so back off to a slow poll: this tab takes over within half a minute
+      // of the holder going away, and stays quiet until then.
+      var code = ev && ev.code;
+      if (code === 4001 || code === 4002) {
+        note('sidecar', code === 4001 ? 'standing by, another tab holds it'
+                                      : 'standing by, a tab with a live shell took over');
+        backoff = 30000;
+        // A 4001 is decided on our hello; a 4002 because the hub believed we had no shell.
+        refusedAs = code === 4001 ? helloShell : false;
+      } else {
+        refusedAs = null;
+        if (opened) note('sidecar', 'disconnected');
+      }
       scheduleReconnect();
+      reportShell();      // a shell that came up after the hub judged us gets its say now
     };
     ws.onerror = function () { try { ws.close(); } catch (e) { /* already closing */ } };
   }

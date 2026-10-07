@@ -191,3 +191,49 @@ If the sidecar never connects, check in this order:
 3. Only then suspect the hub.
 
 A hanging request with no error is almost never a bug in the hub. It is one of these two.
+
+## 3. Which page holds the link
+
+The hub serves exactly one page at a time. The userscript matches every `connect.raspberrypi.com`
+page, so the dashboard, a screen-sharing window and any number of shell windows can all knock.
+
+The page tells the hub about itself in two JSON messages:
+
+| Message | Sent | Fields |
+|---|---|---|
+| `{"type":"hello", ...}` | once, when the socket opens | `version`, `path`, `shell` |
+| `{"type":"status", ...}` | whenever the `shell` channel opens or closes | `shell`, `path` |
+
+`shell` is `true` only while the page's `shell` data channel is open. Bridges before 0.2.2 send no
+`shell` field at all, and the hub treats a missing value as unknown, never as false.
+
+The first page to connect holds the link. A later page is judged on its `hello`, and the hub
+closes one of the two sockets with a custom code:
+
+| Code | Meaning | What the page does |
+|---|---|---|
+| `4001` | another page holds the link; this one stands by | retries every 30s |
+| `4002` | this page held the link with no shell, and a page with one took over | retries every 30s |
+| `4003` | wrong `Origin` | — |
+
+The takeover rule has one clause. A newcomer that reports `shell: true` replaces a holder that has
+reported `shell: false`. Nothing else displaces a holder: not a second shell page, not a shell-less
+page, not anything facing a holder whose shell is unknown. The page that was displaced has no
+shell, so it can only win back if the new holder genuinely loses its own shell. That is why this
+cannot turn back into the ping-pong that preferring the newest page caused.
+
+The order of events in a real tab matters. The sidecar socket opens at document-start, and the
+WebRTC handshake finishes a second or two later. So a fresh shell window usually says
+`shell: false` in its hello and is stood by. When its shell opens, it reconnects straight away
+instead of waiting out the 30s, and that second hello wins.
+
+### Why it keys on the shell, not the URL
+
+Observed 2026-10-06 on the `/devices` dashboard: the "Remote shell" item is a Stimulus
+`popup-button` that calls `window.open(href, '_blank', 'popup=yes,width=720,height=480')`. If the
+popup is blocked, it falls back to `location.href = href`. Both routes load the shell page as a
+**new document**, so today a dashboard document never gains a shell in place. Not connecting from
+`/devices` would therefore have worked, but it would bet on the site's routes and on Turbo never
+visiting a shell page in place. It would also leave the other failure open: a shell window whose
+session has ended still holds the slot while a live one waits. Keying on the shell covers both
+cases and needs no list of URLs.

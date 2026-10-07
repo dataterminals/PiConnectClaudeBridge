@@ -77,7 +77,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   await check('pi_health reports a healthy bridge', async () => {
     const r = await callTool('pi_health', {});
-    const h = JSON.parse(r.result.content[0].text);
+    const h = JSON.parse(r.result.content[0].text).bridge;   // beside attachedPage, since b8ada87
     assert.strictEqual(h.ok, true, 'problems: ' + JSON.stringify(h.problems));
     assert.strictEqual(h.status.shell, 'open');
   });
